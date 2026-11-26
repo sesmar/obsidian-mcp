@@ -1,0 +1,313 @@
+{
+  "collections": {
+    "client": {
+      "label": "Client",
+      "folder": "Clients",
+      "id_property": "client_code",
+      "title_property": "client_name",
+      "path_template": "Clients/{client_code} - {client_name}",
+      "template": "Templates/Client.md",
+      "required": [
+        "client_code",
+        "client_name",
+        "status"
+      ],
+      "properties": {
+        "client_code": {
+          "type": "string",
+          "description": "Stable client identifier, e.g. DEMO"
+        },
+        "client_name": {
+          "type": "string"
+        },
+        "status": {
+          "type": "enum",
+          "values": [
+            "Active",
+            "Inactive",
+            "Prospective",
+            "Archived"
+          ],
+          "default": "Active"
+        },
+        "record_type": {
+          "type": "string",
+          "default": "Client"
+        },
+        "created": {
+          "type": "date"
+        }
+      },
+      "status_property": "status",
+      "inactive_statuses": [
+        "Inactive",
+        "Archived"
+      ],
+      "archived_status": "Archived",
+      "protected_properties": [],
+      "notes_heading": "Notes"
+    },
+    "matter": {
+      "label": "Matter",
+      "folder": "Matters",
+      "id_property": "docket_number",
+      "title_property": "title",
+      "path_template": "Matters/{client_id}/{docket_number}",
+      "template": "Templates/Matter.md",
+      "required": [
+        "docket_number",
+        "client",
+        "status"
+      ],
+      "properties": {
+        "docket_number": {
+          "type": "string",
+          "description": "Firm docket number, e.g. DEMO-101-A"
+        },
+        "client": {
+          "type": "link"
+        },
+        "title": {
+          "type": "string"
+        },
+        "status": {
+          "type": "enum",
+          "values": [
+            "Active",
+            "Pending",
+            "Allowed",
+            "Issued",
+            "Abandoned",
+            "Closed",
+            "Archived"
+          ],
+          "default": "Active"
+        },
+        "matter_type": {
+          "type": "enum",
+          "values": [
+            "Utility",
+            "Provisional",
+            "PCT",
+            "Design",
+            "Continuation",
+            "Divisional",
+            "CIP",
+            "Foreign",
+            "Other"
+          ]
+        },
+        "jurisdiction": {
+          "type": "string"
+        },
+        "application_number": {
+          "type": "string"
+        },
+        "filing_date": {
+          "type": "date"
+        },
+        "priority_date": {
+          "type": "date"
+        },
+        "publication_number": {
+          "type": "string"
+        },
+        "patent_number": {
+          "type": "string"
+        },
+        "examiner": {
+          "type": "string"
+        },
+        "art_unit": {
+          "type": "string"
+        },
+        "family": {
+          "type": "string"
+        },
+        "related_matters": {
+          "type": "list"
+        },
+        "record_type": {
+          "type": "string",
+          "default": "Matter"
+        },
+        "created": {
+          "type": "date"
+        }
+      },
+      "parent_collection": "client",
+      "parent_property": "client",
+      "status_property": "status",
+      "inactive_statuses": [
+        "Closed",
+        "Abandoned",
+        "Archived"
+      ],
+      "archived_status": "Archived",
+      "protected_properties": [],
+      "notes_heading": "Matter Notes",
+      "related_property": "related_matters",
+      "family_property": "family"
+    },
+    "work_product": {
+      "label": "Work Product",
+      "folder": "Work Products",
+      "id_property": "work_product_id",
+      "title_property": "title",
+      "path_template": "Work Products/{matter_id}/{work_product_id} {work_product_type}",
+      "template": "Templates/Work Product.md",
+      "required": [
+        "work_product_id",
+        "matter",
+        "work_product_type",
+        "status"
+      ],
+      "properties": {
+        "work_product_id": {
+          "type": "string"
+        },
+        "matter": {
+          "type": "link"
+        },
+        "title": {
+          "type": "string"
+        },
+        "work_product_type": {
+          "type": "enum",
+          "values": [
+            "Non-Final Office Action Response",
+            "Final Office Action Response",
+            "Restriction Response",
+            "Application Drafting",
+            "Notice of Allowance",
+            "Inventor Interview",
+            "Examiner Interview",
+            "Information Disclosure Statement",
+            "Appeal",
+            "Foreign Filing",
+            "Client Report",
+            "Other"
+          ]
+        },
+        "status": {
+          "type": "enum",
+          "values": [
+            "Not Started",
+            "In Progress",
+            "Waiting",
+            "In Review",
+            "Ready for Filing",
+            "Filed",
+            "Completed",
+            "Cancelled",
+            "Archived"
+          ],
+          "default": "Not Started"
+        },
+        "priority": {
+          "type": "enum",
+          "values": [
+            "Urgent",
+            "High",
+            "Normal",
+            "Low"
+          ],
+          "default": "Normal"
+        },
+        "due_date": {
+          "type": "date",
+          "description": "Deadline (copied from the firm docketing system). Protected."
+        },
+        "target_date": {
+          "type": "date",
+          "description": "Internal completion target"
+        },
+        "follow_up_date": {
+          "type": "date"
+        },
+        "assigned_date": {
+          "type": "date"
+        },
+        "completed_date": {
+          "type": "date"
+        },
+        "next_action": {
+          "type": "string"
+        },
+        "waiting_on": {
+          "type": "string"
+        },
+        "record_type": {
+          "type": "string",
+          "default": "Work Product"
+        },
+        "created": {
+          "type": "date"
+        }
+      },
+      "parent_collection": "matter",
+      "parent_property": "matter",
+      "status_property": "status",
+      "inactive_statuses": [
+        "Completed",
+        "Filed",
+        "Cancelled",
+        "Archived"
+      ],
+      "archived_status": "Archived",
+      "protected_properties": [
+        "due_date"
+      ],
+      "notes_heading": "Working Notes",
+      "checklist_heading": "Checklist"
+    }
+  },
+  "fields": {
+    "type": "work_product_type",
+    "priority": "priority",
+    "due_date": "due_date",
+    "target_date": "target_date",
+    "follow_up_date": "follow_up_date",
+    "completed_date": "completed_date",
+    "next_action": "next_action",
+    "waiting_on": "waiting_on",
+    "waiting_status": "Waiting",
+    "ready_for_filing_status": "Ready for Filing",
+    "completed_status": "Completed",
+    "reopened_status": "In Progress"
+  },
+  "knowledge_folders": {
+    "case_law": "Knowledge/Case Law",
+    "legal_authorities": "Knowledge/Legal Authorities",
+    "prosecution_strategies": "Knowledge/Prosecution Strategies",
+    "arguments": "Knowledge/Argument Library",
+    "firm_procedures": "Knowledge/Firm Procedures",
+    "research": "Knowledge/Research"
+  },
+  "citation_properties": [
+    "citation",
+    "pinpoint",
+    "court",
+    "date_decided",
+    "source_url",
+    "verified_date",
+    "authority_type"
+  ],
+  "workflows_folder": "Workflows",
+  "workflow_applies_to_property": "applies_to",
+  "templates_folder": "Templates",
+  "client_context_sections": [
+    "Drafting Preferences",
+    "Reporting Requirements",
+    "Prosecution Guidelines",
+    "Client Guidelines",
+    "Contacts"
+  ],
+  "history_sections": [
+    "Strategy",
+    "Outcome",
+    "Summary"
+  ],
+  "context_section_max_chars": 4000,
+  "stale_after_days": 14
+}
