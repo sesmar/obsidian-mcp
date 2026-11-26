@@ -100,7 +100,7 @@ public sealed class VaultServiceTests : IDisposable
     [Fact]
     public async Task Append_under_heading_inserts_at_end_of_section()
     {
-        await _vault.AppendToNote("Project Alpha", "- [ ] Review budget", createIfMissing: false, heading: "Tasks");
+        await _vault.AppendToNote("Project Alpha", "- [ ] Review budget", createIfMissing: false, heading: "Tasks", WriteOptions.Default);
         var text = _tv.Read("Projects/Project Alpha.md");
         var tasks = text.IndexOf("## Tasks");
         var inserted = text.IndexOf("- [ ] Review budget");
@@ -109,67 +109,91 @@ public sealed class VaultServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task Replace_requires_unique_match()
+    public void Replace_requires_unique_match()
     {
-        _tv.Write("Dup.md", "a b a");
-        await Assert.ThrowsAsync<VaultException>(() => _vault.ReplaceInNote("Dup", "a", "x", replaceAll: false));
-        var (_, n) = await _vault.ReplaceInNote("Dup", "a", "x", replaceAll: true);
-        Assert.Equal(2, n);
-        Assert.Equal("x b x", _tv.Read("Dup.md"));
+        Assert.Throws<VaultException>(() => VaultService.ReplaceText("a b a", "a", "x", replaceAll: false, "Dup.md"));
+        Assert.Equal("x b x", VaultService.ReplaceText("a b a", "a", "x", replaceAll: true, "Dup.md"));
     }
 
     [Fact]
     public async Task Move_updates_links_in_other_notes()
     {
-        var (newPath, updated) = await _vault.MoveNote("Project Alpha", "Archive/Alpha Old.md", updateLinks: true);
+        var (newPath, changes) = await _vault.MoveNote("Project Alpha", "Archive/Alpha Old.md", updateLinks: true, WriteOptions.Default);
         Assert.Equal("Archive/Alpha Old.md", newPath);
         Assert.False(_tv.Exists("Projects/Project Alpha.md"));
-        Assert.Contains("Home.md", updated);
+        Assert.Contains(changes, c => c.Path == "Home.md");
 
         var home = _tv.Read("Home.md");
         Assert.Contains("[[Alpha Old]]", home);
         Assert.Contains("(Archive/Alpha%20Old.md)", home);
         Assert.Contains("[[Not A Link]]", home); // code block untouched
         Assert.Contains("[[Alpha Old#Tasks]]", _tv.Read("Ideas/Brainstorm.md"));
-        // The moved note's own wikilink to Home still resolves.
         Assert.Contains("[[Home]]", _tv.Read("Archive/Alpha Old.md"));
     }
 
     [Fact]
-    public async Task Update_frontmatter_preserves_body()
+    public async Task Move_dry_run_changes_nothing()
     {
-        var set = new Dictionary<string, System.Text.Json.JsonElement>
-        {
-            ["status"] = System.Text.Json.JsonDocument.Parse("\"done\"").RootElement,
-            ["priority"] = System.Text.Json.JsonDocument.Parse("2").RootElement,
-        };
-        await _vault.UpdateFrontmatter("Project Alpha", set, ["tags"]);
-        var note = _tv.Service().GetNote("Project Alpha");
-        Assert.Equal("done", note.Parsed.Frontmatter["status"]);
-        Assert.False(note.Parsed.Frontmatter.ContainsKey("tags"));
-        Assert.Contains("## Tasks", note.Content);
-        Assert.StartsWith("---\n", note.Content);
+        var (_, changes) = await _vault.MoveNote("Project Alpha", "Archive/Alpha Old.md", updateLinks: true, new WriteOptions { DryRun = true });
+        Assert.All(changes, c => Assert.True(c.DryRun));
+        Assert.True(_tv.Exists("Projects/Project Alpha.md"));
+        Assert.Contains("[[Project Alpha]]", _tv.Read("Home.md"));
     }
 
     [Fact]
-    public async Task Delete_moves_to_trash()
+    public async Task Writes_are_audited_and_snapshotted()
     {
-        await _vault.DeleteNote("Ideas/Brainstorm", permanent: false);
-        Assert.False(_tv.Exists("Ideas/Brainstorm.md"));
-        Assert.True(_tv.Exists(".trash/Brainstorm.md"));
+        var before = _vault.GetNote("Home").Content;
+        var result = await _vault.AppendToNote("Home", "more", createIfMissing: false, null, new WriteOptions { Reason = "test" });
+        Assert.NotNull(result.AuditId);
+        var entry = Assert.Single(_vault.Audit.Read(null, 10));
+        Assert.Equal("Home.md", entry.Path);
+        Assert.Equal("test", entry.Reason);
+        Assert.Equal(before, _vault.Audit.LoadSnapshot(entry.VersionBefore!));
+    }
+
+    [Fact]
+    public async Task Stale_expected_version_is_rejected()
+    {
+        var version = _vault.GetNote("Home").Version;
+        _tv.Write("Home.md", "changed in Obsidian");
+        await Assert.ThrowsAsync<VaultException>(() =>
+            _vault.AppendToNote("Home", "x", false, null, new WriteOptions { ExpectedVersion = version }));
+        Assert.Equal("changed in Obsidian", _tv.Read("Home.md"));
+    }
+
+    [Fact]
+    public async Task Dry_run_returns_diff_without_writing()
+    {
+        var result = await _vault.AppendToNote("Home", "new line", false, null, new WriteOptions { DryRun = true });
+        Assert.True(result.DryRun);
+        Assert.Contains("+ new line", result.BodyDiff);
+        Assert.DoesNotContain("new line", _tv.Read("Home.md"));
+    }
+
+    [Fact]
+    public void Property_changes_keep_body()
+    {
+        var (content, fm) = VaultService.WithProperties(_tv.Read("Projects/Project Alpha.md"),
+            new Dictionary<string, object?> { ["status"] = "done", ["priority"] = 2L }, ["tags"], "x.md");
+        Assert.Equal("done", fm["status"]);
+        Assert.False(fm.ContainsKey("tags"));
+        Assert.Contains("## Tasks", content);
+        Assert.StartsWith("---\n", content);
     }
 
     [Fact]
     public async Task Read_only_vault_rejects_writes()
     {
         var ro = _tv.Service(readOnly: true);
-        await Assert.ThrowsAsync<VaultException>(() => ro.CreateNote("New", "x", false));
+        await Assert.ThrowsAsync<VaultException>(() => ro.CreateNote("New", "x", WriteOptions.Default));
     }
 
     [Fact]
-    public void Daily_note_path_uses_obsidian_settings()
+    public void Hidden_and_data_folders_are_not_accessible()
     {
-        Assert.Equal("Daily/2026-11-26.md", _vault.DailyNotePath(new DateOnly(2026, 11, 26)));
+        Assert.Throws<VaultException>(() => _vault.ToFullPath(".obsidian-mcp/audit.jsonl"));
+        Assert.Throws<VaultException>(() => _vault.ToFullPath("Notes/.secret.md"));
     }
 
     [Theory]

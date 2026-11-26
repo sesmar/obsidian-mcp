@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -11,17 +10,19 @@ namespace ObsidianMcp.Server.Vault;
 public sealed record Note(string Path, DateTime Modified, long Size, string Content, ParsedNote Parsed)
 {
     public string Title => System.IO.Path.GetFileNameWithoutExtension(Path);
+    public string Version => AuditLog.Version(Content);
+    public Dictionary<string, object?> Properties => Parsed.Frontmatter;
 }
 
 public sealed record FolderEntry(string Path, string Type, long? Size, DateTime? Modified);
-public sealed record SearchHit(string Path, string Title, double Score, string Snippet, IReadOnlyList<string> Tags);
+public sealed record SearchHit(string Path, string Title, double Score, string Snippet, IReadOnlyList<string> Tags, DateTime Modified);
 public sealed record LinkInfo(string Target, string? Subpath, string? ResolvedPath, bool IsEmbed);
 public sealed record Backlink(string Path, int Count, IReadOnlyList<string> Context);
 
 /// <summary>
 /// All file-system access to the vault goes through this class. It guarantees that every path stays
-/// inside the vault root (no "..", absolute paths, or symlink escapes) and that excluded folders
-/// such as .obsidian are never touched.
+/// inside the vault root (no "..", absolute paths, dot-folders or symlink escapes), and that every
+/// modification is atomic, version-checked, previewable and audited.
 /// </summary>
 public sealed class VaultService
 {
@@ -31,9 +32,10 @@ public sealed class VaultService
     private readonly ConcurrentDictionary<string, Note> _index;
     private readonly Lock _refreshLock = new();
     private readonly SemaphoreSlim _writeLock = new(1, 1);
-    private static readonly StringComparison PathComparison =
+    private static readonly UTF8Encoding Utf8NoBom = new(false);
+    internal static readonly StringComparison PathComparison =
         OperatingSystem.IsLinux() ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
-    private static readonly StringComparer PathComparer =
+    internal static readonly StringComparer PathComparer =
         OperatingSystem.IsLinux() ? StringComparer.Ordinal : StringComparer.OrdinalIgnoreCase;
 
     public VaultService(IOptions<VaultOptions> options)
@@ -52,12 +54,17 @@ public sealed class VaultService
         _realRoot = EnsureTrailingSeparator(real);
         _index = new ConcurrentDictionary<string, Note>(PathComparer);
         VaultName = _options.VaultName ?? rootInfo.Name;
+        DataFolder = System.IO.Path.Combine(_root, _options.DataFolder);
+        Audit = new AuditLog(DataFolder);
     }
 
     public string RootPath => _root;
     public string VaultName { get; }
+    public string DataFolder { get; }
+    public AuditLog Audit { get; }
     public bool IsReadOnly => _options.ReadOnly;
     public int MaxResults => _options.MaxResults;
+    public string ArchiveFolder => _options.ArchiveFolder;
 
     // ------------------------------------------------------------------ paths
 
@@ -82,12 +89,11 @@ public sealed class VaultService
     {
         var p = Normalize(path);
         if (p.Length == 0) throw new VaultException("A note path is required.");
-        if (!System.IO.Path.HasExtension(p) || !IsNoteExtension(System.IO.Path.GetExtension(p)))
-            p += ".md";
+        if (!IsNoteExtension(System.IO.Path.GetExtension(p))) p += ".md";
         return p;
     }
 
-    private static bool IsNoteExtension(string ext) => ext.Equals(".md", StringComparison.OrdinalIgnoreCase);
+    public static bool IsNoteExtension(string ext) => ext.Equals(".md", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Maps a normalized vault-relative path to a full path, enforcing all safety checks.</summary>
     public string ToFullPath(string relative)
@@ -101,7 +107,7 @@ public sealed class VaultService
 
         // Refuse anything that is (or lives under) a symlink pointing outside the vault.
         var current = full;
-        while (current.Length >= _root.Length - 1 && IsUnderRoot(current))
+        while (IsUnderRoot(current))
         {
             FileSystemInfo info = Directory.Exists(current) ? new DirectoryInfo(current) : new FileInfo(current);
             if (info.Exists && info.LinkTarget is not null)
@@ -120,10 +126,12 @@ public sealed class VaultService
 
     private bool IsUnderRoot(string full) => full.StartsWith(_root, PathComparison);
 
+    /// <summary>True for dot-folders/files (.obsidian, .trash, the server data folder…) and configured exclusions.</summary>
     public bool IsExcluded(string relative)
     {
         if (relative.Length == 0) return false;
         var segments = relative.Split('/');
+        if (segments.Any(s => s.StartsWith('.'))) return true;
         foreach (var raw in _options.ExcludedFolders)
         {
             var ex = raw.Replace('\\', '/').Trim('/');
@@ -157,7 +165,7 @@ public sealed class VaultService
             foreach (var file in Directory.EnumerateFiles(_root, "*.md", WalkOptions))
             {
                 var rel = ToRelative(file);
-                if (IsExcluded(rel) || rel.Split('/').Any(s => s.StartsWith('.'))) continue;
+                if (IsExcluded(rel)) continue;
                 seen.Add(rel);
                 var fi = new FileInfo(file);
                 if (_index.TryGetValue(rel, out var cached) && cached.Modified == fi.LastWriteTimeUtc && cached.Size == fi.Length)
@@ -168,6 +176,18 @@ public sealed class VaultService
             foreach (var key in _index.Keys)
                 if (!seen.Contains(key)) _index.TryRemove(key, out _);
             return _index.Values.ToList();
+        }
+    }
+
+    /// <summary>All non-excluded files (any type), vault-relative.</summary>
+    public IEnumerable<string> EnumerateFiles(string folder = "")
+    {
+        var full = ToFullPath(Normalize(folder));
+        if (!Directory.Exists(full)) yield break;
+        foreach (var f in Directory.EnumerateFiles(full, "*", WalkOptions))
+        {
+            var rel = ToRelative(f);
+            if (!IsExcluded(rel)) yield return rel;
         }
     }
 
@@ -205,11 +225,17 @@ public sealed class VaultService
         return note;
     }
 
+    public Note? TryGetNote(string path)
+    {
+        try { return GetNote(path); }
+        catch (VaultException) { return null; }
+    }
+
     /// <summary>
     /// For write targets: the exact path if that file exists, otherwise an existing note the name resolves to
     /// (e.g. "Plan" -> "Projects/Plan.md"), otherwise the normalized path for a new note.
     /// </summary>
-    private string ResolveExistingOrNew(string path)
+    public string ResolveExistingOrNew(string path)
     {
         var rel = NormalizeNotePath(path);
         if (File.Exists(ToFullPath(rel))) return rel;
@@ -218,7 +244,7 @@ public sealed class VaultService
 
     // ------------------------------------------------------------------ browsing
 
-    public IReadOnlyList<FolderEntry> ListFolder(string? folder, bool recursive, int? limit = null)
+    public IReadOnlyList<FolderEntry> ListFolder(string? folder, bool recursive, int? limit = null, bool foldersOnly = false)
     {
         var rel = Normalize(folder);
         var full = ToFullPath(rel);
@@ -231,9 +257,11 @@ public sealed class VaultService
             AttributesToSkip = WalkOptions.AttributesToSkip,
         };
         var max = Math.Clamp(limit ?? 500, 1, 5000);
-        return new DirectoryInfo(full).EnumerateFileSystemInfos("*", opts)
+        var dir = new DirectoryInfo(full);
+        IEnumerable<FileSystemInfo> items = foldersOnly ? dir.EnumerateDirectories("*", opts) : dir.EnumerateFileSystemInfos("*", opts);
+        return items
             .Select(i => (Info: i, Rel: ToRelative(i.FullName)))
-            .Where(x => !IsExcluded(x.Rel) && !x.Rel.Split('/').Any(s => s.StartsWith('.')))
+            .Where(x => !IsExcluded(x.Rel))
             .OrderBy(x => x.Info is FileInfo).ThenBy(x => x.Rel, StringComparer.OrdinalIgnoreCase)
             .Take(max)
             .Select(x => x.Info is FileInfo f
@@ -242,24 +270,43 @@ public sealed class VaultService
             .ToList();
     }
 
-    public IReadOnlyList<Note> RecentNotes(int limit) =>
-        GetAllNotes().OrderByDescending(n => n.Modified).Take(Math.Clamp(limit, 1, _options.MaxResults)).ToList();
-
     // ------------------------------------------------------------------ search
 
-    public IReadOnlyList<SearchHit> Search(string query, string? folder = null, string? tag = null, int? limit = null)
+    public sealed record SearchQuery
     {
-        var terms = Tokenize(query);
-        var folderRel = string.IsNullOrWhiteSpace(folder) ? "" : Normalize(folder);
-        var tagFilter = tag?.Trim().TrimStart('#');
-        if (terms.Count == 0 && string.IsNullOrEmpty(tagFilter) && folderRel.Length == 0)
-            throw new VaultException("Provide a query, a tag, or a folder to search.");
+        public string? Text { get; init; }
+        public string? Folder { get; init; }
+        public IReadOnlyList<string>? Tags { get; init; }
+        /// <summary>Property filters: exact (case-insensitive) match, list membership, "*" = present, "!" = missing/empty.</summary>
+        public IReadOnlyDictionary<string, string>? Properties { get; init; }
+        public int? ModifiedWithinDays { get; init; }
+        public int? Limit { get; init; }
+    }
+
+    public IReadOnlyList<SearchHit> Search(string query, string? folder = null, string? tag = null, int? limit = null) =>
+        Search(new SearchQuery
+        {
+            Text = query, Folder = folder, Limit = limit,
+            Tags = string.IsNullOrWhiteSpace(tag) ? null : [tag],
+        });
+
+    public IReadOnlyList<SearchHit> Search(SearchQuery q)
+    {
+        var terms = Tokenize(q.Text);
+        var folderRel = string.IsNullOrWhiteSpace(q.Folder) ? "" : Normalize(q.Folder);
+        var tags = (q.Tags ?? []).Select(t => t.Trim().TrimStart('#')).Where(t => t.Length > 0).ToList();
+        var props = q.Properties ?? new Dictionary<string, string>();
+        var since = q.ModifiedWithinDays is > 0 ? DateTime.UtcNow.AddDays(-q.ModifiedWithinDays.Value) : (DateTime?)null;
+        if (terms.Count == 0 && tags.Count == 0 && props.Count == 0 && folderRel.Length == 0 && since is null)
+            throw new VaultException("Provide a query or at least one filter (folder, tags, properties, modified_within_days).");
 
         var hits = new List<SearchHit>();
         foreach (var note in GetAllNotes())
         {
             if (folderRel.Length > 0 && !note.Path.StartsWith(folderRel + "/", StringComparison.OrdinalIgnoreCase)) continue;
-            if (!string.IsNullOrEmpty(tagFilter) && !HasTag(note, tagFilter)) continue;
+            if (since is not null && note.Modified < since) continue;
+            if (tags.Any(t => !HasTag(note, t))) continue;
+            if (props.Any(p => !MatchesProperty(note.Properties, p.Key, p.Value))) continue;
 
             double score = 0;
             var allMatch = true;
@@ -271,15 +318,49 @@ public sealed class VaultService
                 score += (inTitle ? 10 : 0) + Math.Min(count, 20) + (note.Parsed.Tags.Any(t => t.Equals(term.TrimStart('#'), StringComparison.OrdinalIgnoreCase)) ? 5 : 0);
             }
             if (!allMatch) continue;
-            if (terms.Count > 1 && note.Content.Contains(query.Trim().Trim('"'), StringComparison.OrdinalIgnoreCase)) score += 15;
-            hits.Add(new SearchHit(note.Path, note.Title, score, Snippet(note, terms), note.Parsed.Tags));
+            if (terms.Count > 1 && note.Content.Contains(q.Text!.Trim().Trim('"'), StringComparison.OrdinalIgnoreCase)) score += 15;
+            hits.Add(new SearchHit(note.Path, note.Title, score, Snippet(note, terms), note.Parsed.Tags, note.Modified));
         }
 
         return hits
             .OrderByDescending(h => h.Score)
-            .ThenByDescending(h => _index.TryGetValue(h.Path, out var n) ? n.Modified : DateTime.MinValue)
-            .Take(Math.Clamp(limit ?? _options.MaxResults, 1, _options.MaxResults))
+            .ThenByDescending(h => h.Modified)
+            .Take(Math.Clamp(q.Limit ?? _options.MaxResults, 1, _options.MaxResults))
             .ToList();
+    }
+
+    public static bool MatchesProperty(Dictionary<string, object?> fm, string key, string expected)
+    {
+        fm.TryGetValue(key, out var value);
+        var values = PropertyValues(value);
+        return expected switch
+        {
+            "*" => values.Count > 0,
+            "!" => values.Count == 0,
+            _ => values.Any(v => v.Equals(expected, StringComparison.OrdinalIgnoreCase) ||
+                                 StripLink(v).Equals(StripLink(expected), StringComparison.OrdinalIgnoreCase)),
+        };
+    }
+
+    /// <summary>Flattens a frontmatter value into non-empty strings.</summary>
+    public static List<string> PropertyValues(object? value) => value switch
+    {
+        null => [],
+        string s => string.IsNullOrWhiteSpace(s) ? [] : [s.Trim()],
+        IEnumerable<object?> list => list.SelectMany(PropertyValues).ToList(),
+        _ => [Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? ""],
+    };
+
+    /// <summary>"[[Target|Alias]]" -> "Target".</summary>
+    public static string StripLink(string value)
+    {
+        var v = value.Trim();
+        if (v.StartsWith("[[") && v.EndsWith("]]")) v = v[2..^2];
+        var bar = v.IndexOf('|');
+        if (bar >= 0) v = v[..bar];
+        var hash = v.IndexOf('#');
+        if (hash > 0) v = v[..hash];
+        return v.Trim();
     }
 
     private static List<string> Tokenize(string? query)
@@ -334,7 +415,7 @@ public sealed class VaultService
     /// <summary>Resolves a link target to a vault-relative note path using Obsidian's rules (roughly).</summary>
     public string? ResolveLink(string target, string? sourcePath) => ResolveLink(target, sourcePath, GetAllNotes());
 
-    private static string? ResolveLink(string target, string? sourcePath, IReadOnlyCollection<Note> notes)
+    internal static string? ResolveLink(string target, string? sourcePath, IReadOnlyCollection<Note> notes)
     {
         var t = target.Trim().Replace('\\', '/').TrimStart('/');
         if (t.Length == 0) return sourcePath; // [[#heading]] links to self
@@ -364,6 +445,26 @@ public sealed class VaultService
             .First().Path;
     }
 
+    /// <summary>Resolves a link to a non-note file (attachment) by path or file name.</summary>
+    public string? ResolveAttachment(string target, string? sourcePath)
+    {
+        var t = StripLink(target).Replace('\\', '/').TrimStart('/');
+        if (t.Length == 0) return null;
+        try
+        {
+            var direct = Normalize(t);
+            if (File.Exists(ToFullPath(direct))) return direct;
+            var sourceDir = sourcePath is null ? "" : System.IO.Path.GetDirectoryName(sourcePath)?.Replace('\\', '/') ?? "";
+            if (sourceDir.Length > 0 && CombineRelative(sourceDir, t) is { } rel && !IsExcluded(rel) && File.Exists(ToFullPath(rel))) return rel;
+        }
+        catch (VaultException) { return null; }
+        var name = System.IO.Path.GetFileName(t);
+        return EnumerateFiles()
+            .Where(f => System.IO.Path.GetFileName(f).Equals(name, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(f => f.Count(c => c == '/'))
+            .FirstOrDefault();
+    }
+
     private static string? CombineRelative(string dir, string rel)
     {
         var parts = new List<string>(dir.Split('/', StringSplitOptions.RemoveEmptyEntries));
@@ -380,7 +481,14 @@ public sealed class VaultService
         var note = GetNote(path);
         var notes = GetAllNotes();
         return note.Parsed.Links
-            .Select(l => new LinkInfo(l.Target, l.Subpath, ResolveLink(l.Target, note.Path, notes), l.IsEmbed))
+            .Select(l =>
+            {
+                var ext = System.IO.Path.GetExtension(l.Target);
+                var resolved = ext.Length > 0 && !IsNoteExtension(ext)
+                    ? ResolveAttachment(l.Target, note.Path)
+                    : ResolveLink(l.Target, note.Path, notes);
+                return new LinkInfo(l.Target, l.Subpath, resolved, l.IsEmbed);
+            })
             .ToList();
     }
 
@@ -388,13 +496,16 @@ public sealed class VaultService
     {
         var target = GetNote(path).Path;
         var notes = GetAllNotes();
+        var name = System.IO.Path.GetFileNameWithoutExtension(target);
         var result = new List<Backlink>();
         foreach (var n in notes)
         {
             if (n.Path.Equals(target, PathComparison)) continue;
             var count = n.Parsed.Links.Count(l => ResolveLink(l.Target, n.Path, notes) is { } r && r.Equals(target, PathComparison));
+            // Frontmatter relationships such as `matter: "[[DEMO-101-A]]"` also count as links.
+            count += n.Properties.Values.SelectMany(PropertyValues)
+                .Count(v => v.StartsWith("[[") && ResolveLink(StripLink(v), n.Path, notes) is { } r && r.Equals(target, PathComparison));
             if (count == 0) continue;
-            var name = System.IO.Path.GetFileNameWithoutExtension(target);
             var context = n.Content.Split('\n')
                 .Where(line => line.Contains(name, StringComparison.OrdinalIgnoreCase) && (line.Contains("[[") || line.Contains("](")))
                 .Select(line => line.Trim())
@@ -405,66 +516,170 @@ public sealed class VaultService
         return result.OrderByDescending(b => b.Count).ThenBy(b => b.Path).ToList();
     }
 
-    // ------------------------------------------------------------------ writes
+    // ------------------------------------------------------------------ change management
 
-    private void EnsureWritable()
+    /// <summary>Runs a write operation under the vault-wide write lock.</summary>
+    public async Task<T> WriteAsync<T>(Func<Task<T>> action)
     {
         if (_options.ReadOnly) throw new VaultException("The vault is mounted read-only.");
-    }
-
-    private async Task<T> WithWriteLock<T>(Func<Task<T>> action)
-    {
-        EnsureWritable();
         await _writeLock.WaitAsync();
         try { return await action(); }
         finally { _writeLock.Release(); }
     }
 
-    public Task<string> CreateNote(string path, string content, bool overwrite) => WithWriteLock(async () =>
+    /// <summary>Current file content, or null if it does not exist. Call inside <see cref="WriteAsync{T}"/>.</summary>
+    public string? ReadCurrent(string rel)
+    {
+        var full = ToFullPath(rel);
+        return File.Exists(full) ? File.ReadAllText(full) : null;
+    }
+
+    /// <summary>
+    /// Commits new content for a file (call inside <see cref="WriteAsync{T}"/>). Verifies the expected version,
+    /// computes a preview, and unless dry-run writes atomically, snapshots the previous content and audits.
+    /// </summary>
+    public async Task<ChangeResult> CommitAsync(string rel, string? before, string after, string operation, WriteOptions opts,
+        IReadOnlyList<ValidationIssue>? warnings = null, string? message = null)
+    {
+        var versionBefore = before is null ? null : AuditLog.Version(before);
+        if (opts.ExpectedVersion is { Length: > 0 } expected && !expected.Equals(versionBefore ?? "none", StringComparison.OrdinalIgnoreCase))
+            throw new VaultException(
+                $"'{rel}' was modified since it was read (expected version {expected}, current {versionBefore ?? "none"}). " +
+                "Re-read it and reapply the change.");
+
+        var propertyChanges = DiffProperties(before, after);
+        var (_, bodyBefore) = NoteParser.SplitFrontmatter(before ?? "");
+        var (_, bodyAfter) = NoteParser.SplitFrontmatter(after);
+        var bodyDiff = bodyBefore == bodyAfter ? [] : TextDiff.Lines(bodyBefore, bodyAfter);
+        var versionAfter = AuditLog.Version(after);
+
+        if (opts.DryRun)
+            return new ChangeResult(rel, operation, true, before is null, versionBefore, versionAfter, propertyChanges, bodyDiff, null, warnings,
+                message ?? "Preview only. Nothing was written. Repeat the call with dry_run=false to apply.");
+
+        if (before is not null && before == after)
+            return new ChangeResult(rel, operation, false, false, versionBefore, versionBefore, [], [], null, warnings, "No changes.");
+
+        if (before is not null) Audit.SaveSnapshot(before);
+        await WriteAtomicAsync(rel, after);
+        var entry = Audit.Append(new AuditEntry
+        {
+            Operation = operation, Path = rel, Collection = opts.Collection, RecordId = opts.RecordId,
+            VersionBefore = versionBefore, VersionAfter = versionAfter, Reason = opts.Reason,
+            PropertyChanges = propertyChanges, BodyChanged = bodyDiff.Count > 0,
+        });
+        return new ChangeResult(rel, operation, false, before is null, versionBefore, versionAfter, propertyChanges, bodyDiff, entry.Id, warnings, message);
+    }
+
+    private async Task WriteAtomicAsync(string rel, string content)
+    {
+        var full = ToFullPath(rel);
+        var dir = System.IO.Path.GetDirectoryName(full)!;
+        Directory.CreateDirectory(dir);
+        // Hidden temp file in the same folder, then an atomic rename over the target.
+        var tmp = System.IO.Path.Combine(dir, $".{System.IO.Path.GetFileName(full)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            await File.WriteAllTextAsync(tmp, content, Utf8NoBom);
+            File.Move(tmp, full, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+        _index.TryRemove(rel, out _);
+    }
+
+    private static IReadOnlyList<PropertyChange> DiffProperties(string? before, string after)
+    {
+        var a = NoteParser.ParseYaml(NoteParser.SplitFrontmatter(before ?? "").Yaml);
+        var b = NoteParser.ParseYaml(NoteParser.SplitFrontmatter(after).Yaml);
+        var changes = new List<PropertyChange>();
+        foreach (var key in a.Keys.Union(b.Keys))
+        {
+            a.TryGetValue(key, out var va);
+            b.TryGetValue(key, out var vb);
+            if (JsonSerializer.Serialize(va) != JsonSerializer.Serialize(vb)) changes.Add(new PropertyChange(key, va, vb));
+        }
+        return changes;
+    }
+
+    /// <summary>Moves a file (call inside <see cref="WriteAsync{T}"/>), audited.</summary>
+    public ChangeResult MoveFile(string fromRel, string toRel, string operation, WriteOptions opts)
+    {
+        var src = ToFullPath(fromRel);
+        var dest = ToFullPath(toRel);
+        if (!File.Exists(src)) throw new VaultException($"Not found: '{fromRel}'");
+        if (File.Exists(dest)) throw new VaultException($"A file already exists at '{toRel}'.");
+        var content = File.ReadAllText(src);
+        var version = AuditLog.Version(content);
+        if (opts.ExpectedVersion is { Length: > 0 } expected && !expected.Equals(version, StringComparison.OrdinalIgnoreCase))
+            throw new VaultException($"'{fromRel}' was modified since it was read. Re-read it and try again.");
+        if (opts.DryRun)
+            return new ChangeResult(toRel, operation, true, false, version, version, [], [$"moved from {fromRel}"], null,
+                Message: "Preview only. Nothing was moved.");
+        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(dest)!);
+        File.Move(src, dest);
+        _index.TryRemove(fromRel, out _);
+        var entry = Audit.Append(new AuditEntry
+        {
+            Operation = operation, Path = toRel, FromPath = fromRel, Collection = opts.Collection, RecordId = opts.RecordId,
+            VersionBefore = version, VersionAfter = version, Reason = opts.Reason,
+        });
+        return new ChangeResult(toRel, operation, false, false, version, version, [], [$"moved from {fromRel}"], entry.Id);
+    }
+
+    // ------------------------------------------------------------------ generic note writes
+
+    public Task<ChangeResult> CreateNote(string path, string content, WriteOptions opts) => WriteAsync(async () =>
     {
         var rel = NormalizeNotePath(path);
-        var full = ToFullPath(rel);
-        if (File.Exists(full) && !overwrite)
-            throw new VaultException($"Note already exists: '{rel}'. Use overwrite=true or a different tool to edit it.");
-        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(full)!);
-        await File.WriteAllTextAsync(full, content);
-        return rel;
+        if (ReadCurrent(rel) is not null)
+            throw new VaultException($"Note already exists: '{rel}'. Use update_note or append_to_note to change it.");
+        return await CommitAsync(rel, null, content, "create_note", opts);
     });
 
-    public Task<string> AppendToNote(string path, string content, bool createIfMissing, string? heading = null) => WithWriteLock(async () =>
+    public Task<ChangeResult> AppendToNote(string path, string content, bool createIfMissing, string? heading, WriteOptions opts) => WriteAsync(async () =>
     {
         var rel = ResolveExistingOrNew(path);
-        var full = ToFullPath(rel);
-        if (!File.Exists(full))
-        {
-            if (!createIfMissing) throw new VaultException($"Note not found: '{rel}'");
-            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(full)!);
-            var initial = string.IsNullOrWhiteSpace(heading) ? content : $"## {heading.Trim().TrimStart('#').Trim()}\n\n{content}";
-            await File.WriteAllTextAsync(full, EnsureEndsWithNewline(initial));
-            return rel;
-        }
-
-        var existing = await File.ReadAllTextAsync(full);
-        string updated;
-        if (string.IsNullOrWhiteSpace(heading))
-        {
-            updated = existing.Length == 0 ? content
-                : existing.TrimEnd('\r', '\n') + "\n\n" + content;
-        }
-        else
-        {
-            updated = InsertUnderHeading(existing, heading, content, rel);
-        }
-        await File.WriteAllTextAsync(full, EnsureEndsWithNewline(updated));
-        return rel;
+        return await CommitAsync(rel, ReadCurrent(rel) is { } before ? before : NotFoundOr(rel, createIfMissing),
+            AppendContent(ReadCurrent(rel), content, heading, rel), "append_to_note", opts);
     });
 
+    private static string? NotFoundOr(string rel, bool create) =>
+        create ? null : throw new VaultException($"Note not found: '{rel}'");
+
+    /// <summary>Appends at the end of the note or of a heading's section (creating the heading if needed).</summary>
+    public static string AppendContent(string? existing, string content, string? heading, string rel, bool createHeading = true)
+    {
+        if (existing is null)
+        {
+            var initial = string.IsNullOrWhiteSpace(heading) ? content : $"## {CleanHeading(heading)}\n\n{content}";
+            return EnsureEndsWithNewline(initial);
+        }
+        if (string.IsNullOrWhiteSpace(heading))
+            return EnsureEndsWithNewline(existing.Length == 0 ? content : existing.TrimEnd('\r', '\n') + "\n\n" + content);
+        var inserted = TryInsertUnderHeading(existing, heading, content);
+        if (inserted is not null) return EnsureEndsWithNewline(inserted);
+        if (!createHeading) throw new VaultException($"Heading '{CleanHeading(heading)}' not found in '{rel}'.");
+        return EnsureEndsWithNewline(existing.TrimEnd('\r', '\n') + $"\n\n## {CleanHeading(heading)}\n\n{content}");
+    }
+
+    private static string CleanHeading(string h) => h.Trim().TrimStart('#').Trim();
     private static string EnsureEndsWithNewline(string s) => s.EndsWith('\n') ? s : s + "\n";
 
-    private static string InsertUnderHeading(string content, string heading, string insert, string rel)
+    /// <summary>Returns the text of a heading's section (without the heading line), or null.</summary>
+    public static string? GetSection(string content, string heading)
     {
-        var wanted = heading.Trim().TrimStart('#').Trim();
-        var lines = content.Replace("\r\n", "\n").Split('\n').ToList();
+        var (start, end, _) = FindSection(content.Replace("\r\n", "\n").Split('\n').ToList(), heading);
+        if (start < 0) return null;
+        var lines = content.Replace("\r\n", "\n").Split('\n');
+        return string.Join('\n', lines[(start + 1)..end]).Trim();
+    }
+
+    private static (int Start, int End, int Level) FindSection(List<string> lines, string heading)
+    {
+        var wanted = CleanHeading(heading);
         int start = -1, level = 0;
         var inFence = false;
         for (var i = 0; i < lines.Count; i++)
@@ -476,86 +691,63 @@ public sealed class VaultService
             if (!m.Success) continue;
             if (start < 0)
             {
-                if (m.Groups[2].Value.Trim().Equals(wanted, StringComparison.OrdinalIgnoreCase))
-                {
-                    start = i; level = m.Groups[1].Length;
-                }
+                if (m.Groups[2].Value.Trim().Equals(wanted, StringComparison.OrdinalIgnoreCase)) { start = i; level = m.Groups[1].Length; }
             }
-            else if (m.Groups[1].Length <= level)
-            {
-                return Splice(lines, start, i, insert);
-            }
+            else if (m.Groups[1].Length <= level) return (start, i, level);
         }
-        if (start < 0) throw new VaultException($"Heading '{wanted}' not found in '{rel}'.");
-        return Splice(lines, start, lines.Count, insert);
+        return (start, lines.Count, level);
     }
 
-    private static string Splice(List<string> lines, int headingLine, int sectionEnd, string insert)
+    private static string? TryInsertUnderHeading(string content, string heading, string insert)
     {
+        var lines = content.Replace("\r\n", "\n").Split('\n').ToList();
+        var (start, end, _) = FindSection(lines, heading);
+        if (start < 0) return null;
         // Insert after the last non-blank line of the section.
-        var at = sectionEnd;
-        while (at - 1 > headingLine && string.IsNullOrWhiteSpace(lines[at - 1])) at--;
+        var at = end;
+        while (at - 1 > start && string.IsNullOrWhiteSpace(lines[at - 1])) at--;
         var block = new List<string>();
-        if (at - 1 == headingLine) block.Add("");
+        if (at - 1 == start) block.Add("");
         block.AddRange(insert.Replace("\r\n", "\n").TrimEnd('\n').Split('\n'));
-        if (at < lines.Count) block.Add("");
+        if (lines.Skip(at).Any(l => !string.IsNullOrWhiteSpace(l))) block.Add("");
         lines.InsertRange(at, block);
         return string.Join('\n', lines);
     }
 
-    public Task<(string Path, int Replacements)> ReplaceInNote(string path, string oldText, string newText, bool replaceAll) => WithWriteLock(async () =>
+    /// <summary>Exact text replacement. Returns the new content.</summary>
+    public static string ReplaceText(string content, string oldText, string newText, bool replaceAll, string rel)
     {
         if (string.IsNullOrEmpty(oldText)) throw new VaultException("old_text must not be empty.");
-        var note = GetNote(path);
-        var full = ToFullPath(note.Path);
-        var content = await File.ReadAllTextAsync(full);
-        var count = CountOrdinal(content, oldText);
-        if (count == 0) throw new VaultException($"Text not found in '{note.Path}'. Read the note first and copy the text exactly.");
-        if (count > 1 && !replaceAll)
-            throw new VaultException($"Text occurs {count} times in '{note.Path}'. Include more surrounding text or set replace_all=true.");
-        var updated = replaceAll ? content.Replace(oldText, newText, StringComparison.Ordinal) : ReplaceFirst(content, oldText, newText);
-        await File.WriteAllTextAsync(full, updated);
-        return (note.Path, replaceAll ? count : 1);
-    });
-
-    private static int CountOrdinal(string text, string term)
-    {
         int count = 0, i = 0;
-        while ((i = text.IndexOf(term, i, StringComparison.Ordinal)) >= 0) { count++; i += term.Length; }
-        return count;
+        while ((i = content.IndexOf(oldText, i, StringComparison.Ordinal)) >= 0) { count++; i += oldText.Length; }
+        if (count == 0) throw new VaultException($"Text not found in '{rel}'. Read the note first and copy the text exactly.");
+        if (count > 1 && !replaceAll)
+            throw new VaultException($"Text occurs {count} times in '{rel}'. Include more surrounding text or set replace_all=true.");
+        if (replaceAll) return content.Replace(oldText, newText, StringComparison.Ordinal);
+        var at = content.IndexOf(oldText, StringComparison.Ordinal);
+        return content[..at] + newText + content[(at + oldText.Length)..];
     }
 
-    private static string ReplaceFirst(string text, string oldText, string newText)
+    /// <summary>Applies property changes to a note's content, keeping the body intact.</summary>
+    public static (string Content, Dictionary<string, object?> Properties) WithProperties(
+        string content, IReadOnlyDictionary<string, object?>? set, IEnumerable<string>? remove, string rel)
     {
-        var i = text.IndexOf(oldText, StringComparison.Ordinal);
-        return text[..i] + newText + text[(i + oldText.Length)..];
-    }
-
-    public Task<Dictionary<string, object?>> UpdateFrontmatter(string path, Dictionary<string, JsonElement>? set, IEnumerable<string>? remove) => WithWriteLock(async () =>
-    {
-        var note = GetNote(path);
-        var full = ToFullPath(note.Path);
-        var content = await File.ReadAllTextAsync(full);
         var (yaml, body) = NoteParser.SplitFrontmatter(content);
         var fm = NoteParser.ParseYaml(yaml);
-        if (fm.ContainsKey("_error")) throw new VaultException($"'{note.Path}' has invalid YAML frontmatter; fix it with replace_in_note instead.");
-        foreach (var (k, v) in set ?? []) fm[k] = NoteParser.FromJson(v);
+        if (fm.ContainsKey("_error")) throw new VaultException($"'{rel}' has invalid YAML frontmatter; fix it with update_note first.");
+        foreach (var (k, v) in set ?? new Dictionary<string, object?>()) fm[k] = v;
         foreach (var k in remove ?? []) fm.Remove(k);
-        if (fm.Count > 0 && !body.StartsWith('\n') && body.Length > 0) body = body.TrimStart('\r');
-        await File.WriteAllTextAsync(full, NoteParser.Compose(fm, body));
-        return fm;
-    });
+        return (NoteParser.Compose(fm, body), fm);
+    }
 
-    public Task<(string NewPath, IReadOnlyList<string> UpdatedNotes)> MoveNote(string from, string to, bool updateLinks) => WithWriteLock(async () =>
+    public Task<(string NewPath, IReadOnlyList<ChangeResult> Changes)> MoveNote(string from, string to, bool updateLinks, WriteOptions opts) => WriteAsync(async () =>
     {
         var source = GetNote(from);
         var destRel = NormalizeNotePath(to.EndsWith('/') ? to + System.IO.Path.GetFileName(source.Path) : to);
-        var srcFull = ToFullPath(source.Path);
-        var destFull = ToFullPath(destRel);
-        if (File.Exists(destFull)) throw new VaultException($"A note already exists at '{destRel}'.");
+        if (File.Exists(ToFullPath(destRel))) throw new VaultException($"A note already exists at '{destRel}'.");
 
         var notes = GetAllNotes();
-        var edits = new List<(string Path, string Content)>();
+        var edits = new List<(string Path, string Before, string After)>();
         if (updateLinks)
         {
             var newName = System.IO.Path.GetFileNameWithoutExtension(destRel);
@@ -566,8 +758,6 @@ public sealed class VaultService
             foreach (var n in notes)
             {
                 var isSelf = n.Path.Equals(source.Path, PathComparison);
-                if (!isSelf && !n.Parsed.Links.Any(l => ResolveLink(l.Target, n.Path, notes) is { } r && r.Equals(source.Path, PathComparison)))
-                    continue;
                 var notePathAfter = isSelf ? destRel : n.Path;
                 var updated = NoteParser.RewriteLinks(n.Content, (link, isWiki) =>
                 {
@@ -580,68 +770,25 @@ public sealed class VaultService
                     if (isSelf && !isWiki) return RelativeLink(destRel, resolved);
                     return null;
                 });
-                if (!string.Equals(updated, n.Content, StringComparison.Ordinal)) edits.Add((notePathAfter, updated));
+                if (!string.Equals(updated, n.Content, StringComparison.Ordinal)) edits.Add((notePathAfter, n.Content, updated));
             }
         }
 
-        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(destFull)!);
-        File.Move(srcFull, destFull);
-        foreach (var (p, c) in edits) await File.WriteAllTextAsync(ToFullPath(p), c);
-        return (destRel, (IReadOnlyList<string>)edits.Select(e => e.Path).Where(p => !p.Equals(destRel, PathComparison)).ToList());
+        var changes = new List<ChangeResult> { MoveFile(source.Path, destRel, "move_note", opts) };
+        var editOpts = opts with { ExpectedVersion = null };
+        foreach (var (p, before, after) in edits)
+        {
+            // In dry-run mode the moved note still lives at its old path.
+            var current = opts.DryRun ? before : ReadCurrent(p) ?? before;
+            changes.Add(await CommitAsync(p, current, after, "update_links", editOpts));
+        }
+        return (destRel, (IReadOnlyList<ChangeResult>)changes);
     });
 
     private static string RelativeLink(string fromNote, string toNote)
     {
         var fromDir = System.IO.Path.GetDirectoryName(fromNote)?.Replace('\\', '/') ?? "";
         return fromDir.Length == 0 ? toNote : System.IO.Path.GetRelativePath("/" + fromDir, "/" + toNote).Replace('\\', '/');
-    }
-
-    public Task<string> DeleteNote(string path, bool permanent) => WithWriteLock(() =>
-    {
-        var note = GetNote(path);
-        var full = ToFullPath(note.Path);
-        if (permanent)
-        {
-            File.Delete(full);
-            _index.TryRemove(note.Path, out _);
-            return Task.FromResult($"Permanently deleted '{note.Path}'.");
-        }
-        // Same behaviour as Obsidian's "Move to Obsidian trash" (.trash folder in the vault root).
-        var trash = System.IO.Path.Combine(_root, ".trash");
-        Directory.CreateDirectory(trash);
-        var name = System.IO.Path.GetFileName(full);
-        var dest = System.IO.Path.Combine(trash, name);
-        if (File.Exists(dest))
-            dest = System.IO.Path.Combine(trash, $"{System.IO.Path.GetFileNameWithoutExtension(name)} {DateTime.Now:yyyyMMddHHmmss}.md");
-        File.Move(full, dest);
-        _index.TryRemove(note.Path, out _);
-        return Task.FromResult($"Moved '{note.Path}' to the vault's .trash folder.");
-    });
-
-    // ------------------------------------------------------------------ daily notes
-
-    public string DailyNotePath(DateOnly date)
-    {
-        string? folder = _options.DailyNotesFolder, format = _options.DailyNotesFormat;
-        if (folder is null || format is null)
-        {
-            try
-            {
-                var cfg = System.IO.Path.Combine(_root, ".obsidian", "daily-notes.json");
-                if (File.Exists(cfg))
-                {
-                    using var doc = JsonDocument.Parse(File.ReadAllText(cfg));
-                    if (folder is null && doc.RootElement.TryGetProperty("folder", out var f)) folder = f.GetString();
-                    if (format is null && doc.RootElement.TryGetProperty("format", out var fmt) && !string.IsNullOrWhiteSpace(fmt.GetString()))
-                        format = NoteParser.MomentToDotNet(fmt.GetString()!);
-                }
-            }
-            catch (Exception e) when (e is IOException or JsonException) { /* fall back to defaults */ }
-        }
-        format ??= "yyyy-MM-dd";
-        var name = date.ToString(format, CultureInfo.InvariantCulture);
-        var rel = string.IsNullOrWhiteSpace(folder) ? name : $"{folder.Trim('/')}/{name}";
-        return NormalizeNotePath(rel);
     }
 
     public string ObsidianUrl(string path) =>

@@ -18,7 +18,7 @@ public sealed class SearchFetchTools(VaultService vault)
     public CallToolResult Search([Description("Search query.")] string query)
     {
         var results = string.IsNullOrWhiteSpace(query)
-            ? vault.RecentNotes(20).Select(n => new { id = n.Path, title = n.Title, url = vault.ObsidianUrl(n.Path) })
+            ? vault.GetAllNotes().OrderByDescending(n => n.Modified).Take(20).Select(n => new { id = n.Path, title = n.Title, url = vault.ObsidianUrl(n.Path) })
             : vault.Search(query, limit: 20).Select(h => new { id = h.Path, title = h.Title, url = vault.ObsidianUrl(h.Path) });
         return Json(new { results });
     }

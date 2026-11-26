@@ -26,15 +26,16 @@ public sealed class VaultOptions
     public long MaxNoteBytes { get; set; } = 5 * 1024 * 1024;
 
     /// <summary>
-    /// Folder for daily notes. If null, it is read from .obsidian/daily-notes.json, falling back to the vault root.
+    /// Folder (inside the vault) for the server's own data: audit log, change snapshots and schema.json.
+    /// Dot-folders are never exposed through the tools.
     /// </summary>
-    public string? DailyNotesFolder { get; set; }
+    public string DataFolder { get; set; } = ".obsidian-mcp";
 
-    /// <summary>
-    /// .NET date format for daily note file names. If null, it is read from .obsidian/daily-notes.json
-    /// (Moment.js format, converted), falling back to yyyy-MM-dd.
-    /// </summary>
-    public string? DailyNotesFormat { get; set; }
+    /// <summary>Path to the record schema (JSON). Defaults to {DataFolder}/schema.json; built-in defaults if missing.</summary>
+    public string? SchemaPath { get; set; }
+
+    /// <summary>Folder that archive_note moves ordinary notes into.</summary>
+    public string ArchiveFolder { get; set; } = "Archive";
 
     /// <summary>
     /// Expose the generic "search" and "fetch" tools in the shape ChatGPT connectors / deep research expect.

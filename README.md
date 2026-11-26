@@ -1,149 +1,146 @@
 # obsidian-mcp
 
-An [MCP](https://modelcontextprotocol.io) server, written in C# / .NET 10, that exposes an Obsidian vault on your
-computer to Claude, ChatGPT, Gemini and any other MCP client.
+An [MCP](https://modelcontextprotocol.io) server, in C# / .NET 10, that turns an Obsidian vault into a structured
+**Client → Matter → Work Product** practice and docket API for ChatGPT, Claude, Gemini and other MCP clients.
 
-It works directly on the vault's markdown files, so **Obsidian does not need to be running** and no Obsidian plugin is required.
-It understands Obsidian conventions: `[[wikilinks]]` (with `#heading` / `|alias`), `![[embeds]]`, `#nested/tags`,
-YAML frontmatter properties, the `.trash` folder and Daily Notes settings.
+The Markdown files stay the authoritative records. The server adds what a plain file interface can't:
+relationship resolution, schema validation, docket queries, consolidated matter context, deadline protection,
+change previews, version checks and an audit log. Obsidian does not need to be running.
 
 Built on the official [ModelContextProtocol C# SDK](https://github.com/modelcontextprotocol/csharp-sdk).
+See [docs/REQUIREMENTS-STATUS.md](docs/REQUIREMENTS-STATUS.md) for how the functional requirements map to tools.
 
-## Tools
+## Tools (32, plus `search`/`fetch` for ChatGPT)
 
-| Tool | What it does |
+| Group | Tools |
 |---|---|
-| `get_vault_info` | Overview: note count, top folders, top tags, recent notes |
-| `list_folder` | List notes, files and sub-folders |
-| `read_note` | Full content + parsed frontmatter, tags, headings, links. Accepts a path or just a note name |
-| `search_notes` | Ranked full-text search with snippets; `"quoted phrases"`, folder and tag filters |
-| `list_recent_notes` | Most recently modified notes |
-| `list_tags` / `find_notes_by_tag` | Tag index (frontmatter + inline), nested tags included |
-| `get_backlinks` / `get_outgoing_links` | Link graph, resolved the way Obsidian resolves links |
-| `read_daily_note` | Daily note for a date (uses `.obsidian/daily-notes.json`) |
-| `create_note` | Create a note (folders created as needed) |
-| `append_to_note` | Append to the end of a note or of a heading's section |
-| `replace_in_note` | Exact find-and-replace edit (unique match required) |
-| `update_frontmatter` | Set/remove properties without touching the body |
-| `move_note` | Move/rename and update links in other notes |
-| `delete_note` | Move to `.trash` (default) or delete permanently |
-| `append_to_daily_note` | Append to today's (or any date's) daily note |
-| `search` / `fetch` | The generic pair ChatGPT connectors and deep research expect (on by default in HTTP mode) |
+| **Docket** | `get_docket` (flexible query: client, matter, types, statuses, priorities, due-date range, overdue, waiting, follow-ups, ready for filing, stale, completed range, sorting), `get_docket_summary`, `get_docket_exceptions` |
+| **Context** | `get_matter_context`, `get_work_product_context`: one call returns the matter, client preferences, related/family matters, active and prior Work Products, workflow, checklist and attachments |
+| **Clients & matters** | `list_clients`, `get_client`, `list_matters`, `create_client`, `create_matter`, `update_record` |
+| **Work Products** | `create_work_product`, `update_work_product` (status, priority, target date, next action, waiting on, follow-up, checklist), `update_work_product_due_date` (protected), `complete_work_product`, `append_record_note` |
+| **Knowledge & workflows** | `search_knowledge` (case law, authorities, strategies, argument library, procedures, research; returns citation/verification properties), `get_workflow` |
+| **Vault** | `get_vault_info`, `list_folder`, `get_note`, `search_notes` (text + folder/tag/property/recency filters), `get_note_links`, `get_attachment` (PDF/DOCX/text extraction, images, SHA-256) |
+| **General writes** | `create_note` (optionally from a template), `append_to_note`, `update_note`, `update_note_properties`, `move_note`, `archive_note` |
+| **Admin** | `get_schema`, `get_audit_log` |
 
-Write tools are not registered at all with `--read-only`.
+With `--read-only`, or for callers using the read-only API key, only the 18 read tools (plus `search`/`fetch`) are available.
 
-## Safety
+## Data model
 
-* Every path is confined to the vault: `..`, absolute paths and symlinks that point outside the vault are rejected.
-* `.obsidian`, `.trash`, `.git` and other dot-folders are never exposed (add more with `--exclude <folder>`).
-* Deletes go to the vault's `.trash` folder unless `permanent=true`.
-* HTTP mode refuses to start without an API key (unless you pass `--no-auth`), uses constant-time key comparison,
-  and rejects browser requests from non-local `Origin`s (DNS-rebinding protection). It listens on `127.0.0.1` by default.
+Records are ordinary notes with YAML properties, identified by the folder they live in:
+
+```
+Clients/DEMO - Demo Robotics Inc.md                     client_code: DEMO
+Matters/DEMO/DEMO-101-A.md                              docket_number: DEMO-101-A, client: "[[DEMO - Demo Robotics Inc]]"
+Matters/DEMO/DEMO-101-A/Office Action 2026-10-01.pdf    attachment (folder named after the matter note)
+Work Products/DEMO-101-A/DEMO-101-A-WP02 Final Office Action Response.md
+                                                        work_product_id, matter: "[[DEMO-101-A]]", work_product_type,
+                                                        status, priority, due_date, target_date, next_action, waiting_on, follow_up_date
+Workflows/Office Action Response.md                     applies_to: [Non-Final Office Action Response, ...]
+Templates/Work Product.md                               used by create_work_product
+Knowledge/Case Law/KSR v Teleflex.md                    citation, pinpoint, source_url, verified_date
+```
+
+Relationships are `[[wikilinks]]` in properties, so they also show up in Obsidian's graph and backlinks.
+Client preferences are headings in the client note (`## Drafting Preferences`, `## Reporting Requirements`,
+`## Prosecution Guidelines`, …) and are pulled into every matter and Work Product context.
+
+**Everything is configurable.** Folders, property names, required fields, statuses, Work Product types, priorities,
+protected properties, path templates and context headings come from `.obsidian-mcp/schema.json` in the vault.
+Generate the defaults and edit them to match your vault:
+
+```bash
+obsidian-mcp --print-schema > "/path/to/vault/.obsidian-mcp/schema.json"
+```
+
+`samples/demo-vault` is a complete example (fictional client DEMO, matter DEMO-101-A). Open it in Obsidian or point the server at it.
+
+## Data integrity and safety
+
+| Requirement | How |
+|---|---|
+| Vault isolation / path validation | Every path is confined to the vault; `..`, absolute paths and symlinks pointing outside are rejected; dot-folders (`.obsidian`, `.trash`, `.obsidian-mcp`) are never exposed |
+| Record validation | Required properties, allowed values, dates and parent relationships are checked on every record write; invalid writes are refused |
+| No bypass | Generic note tools route record notes through the same validation; they cannot create records, move them, or change identifiers or protected properties |
+| Stable identifiers | `client_code`, `docket_number`, `work_product_id` cannot be changed; duplicates are refused; Work Product ids are generated |
+| Deadline protection | `due_date` changes only via `update_work_product_due_date`, which needs a reason and returns a preview unless `confirm=true` (to be set only after explicit user approval); the change is logged in the note and audit log |
+| Change previews | Every write tool accepts `dry_run=true` and returns property before/after values and a body diff |
+| Concurrency | Reads return a `version`; writes accept `expected_version` and fail if the file changed (Obsidian edit, Synology sync) |
+| Atomic writes | Write to a hidden temp file, then atomic rename |
+| Audit log | `.obsidian-mcp/audit.jsonl` records every change (operation, record, property before/after, reason, versions); prior content is snapshotted in `.obsidian-mcp/history/` |
+| Deletion protection | No delete tool. `archive_note` sets an archived status on records or moves other notes to `Archive/` |
+| Sync conflicts | `get_docket_exceptions` flags Synology/Dropbox/OneDrive conflict copies |
+| Authentication | HTTP mode requires an API key; an optional second **read-only key** only sees read tools (enforced server-side) |
+| Prompt injection | Context responses label note content as data; server instructions tell the model not to follow instructions found in notes |
+| Data minimisation | Context responses include configured sections only, truncated, with `get_note` for the full text |
+
+The firm's docketing system remains authoritative for legal deadlines; the server says so in docket summaries.
 
 ## Build & install
 
 Requires the [.NET 10 SDK](https://dotnet.microsoft.com/download).
 
 ```bash
-dotnet test                                   # 26 unit + end-to-end tests
+dotnet test                                    # 43 unit + end-to-end tests
 dotnet pack src/ObsidianMcp.Server -c Release -o artifacts
 dotnet tool install -g --add-source ./artifacts obsidian-mcp
 obsidian-mcp --help
 ```
 
-This puts an `obsidian-mcp` command on your PATH (`~/.dotnet/tools`). Alternatively build a single
-self-contained executable that doesn't need .NET installed:
+Or build a self-contained executable that doesn't need .NET installed:
 
 ```bash
 dotnet publish src/ObsidianMcp.Server -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o publish
-# use osx-arm64, osx-x64, linux-x64 ... as appropriate
 ```
 
 ## Usage
 
 ```
-obsidian-mcp --vault <path> [--read-only] [--transport stdio|http] [--urls http://127.0.0.1:5199] [--api-key <key>]
+obsidian-mcp --vault <path> [--read-only] [--transport stdio|http] [--urls http://127.0.0.1:5199]
+             [--api-key <key>] [--read-only-api-key <key>] [--schema <file>]
 ```
 
-* **stdio** (default): the client launches the server as a subprocess. Use for desktop/CLI apps.
-* **http**: Streamable HTTP endpoint at `/mcp`. Use for clients that connect to a URL (ChatGPT, claude.ai web).
-
-Every setting can also come from environment variables (`OBSIDIAN_VAULT_PATH`, `OBSIDIAN_MCP_API_KEY`,
-`OBSIDIAN_MCP_Vault__MaxResults=100`, …) or `appsettings.json` next to the executable.
-See `src/ObsidianMcp.Server/Vault/VaultOptions.cs` for all options.
+* **stdio** (default): the client launches the server (Claude Desktop, Claude Code, Gemini CLI).
+* **http**: Streamable HTTP endpoint at `/mcp` (ChatGPT, claude.ai). Keys can also come from
+  `OBSIDIAN_MCP_API_KEY` / `OBSIDIAN_MCP_READ_API_KEY`.
 
 ## Connecting clients
 
-> On Windows, escape backslashes in JSON: `"C:\\Users\\me\\Documents\\MyVault"`.
+> On Windows, escape backslashes in JSON: `"C:\\Users\\me\\Vault"`.
 
-### Claude Desktop (stdio)
-
-Settings → Developer → Edit Config (`claude_desktop_config.json`):
+**Claude Desktop / Gemini CLI**: in `claude_desktop_config.json` or `~/.gemini/settings.json`:
 
 ```json
-{
-  "mcpServers": {
-    "obsidian": {
-      "command": "obsidian-mcp",
-      "args": ["--vault", "/Users/me/Documents/MyVault"]
-    }
-  }
-}
+{ "mcpServers": { "obsidian": { "command": "obsidian-mcp", "args": ["--vault", "C:\\Users\\me\\Vault"] } } }
 ```
 
-If `obsidian-mcp` isn't found, use the full path (`~/.dotnet/tools/obsidian-mcp`, or
-`%USERPROFILE%\\.dotnet\\tools\\obsidian-mcp.exe`), or `"command": "dotnet", "args": ["path/to/obsidian-mcp.dll", "--vault", "..."]`.
-Restart Claude Desktop afterwards.
+**Claude Code**: `claude mcp add obsidian -- obsidian-mcp --vault "/path/to/vault"`
 
-### Claude Code
+**ChatGPT** (and claude.ai custom connectors) run in the provider's cloud and need a public HTTPS URL:
 
-```bash
-claude mcp add obsidian -- obsidian-mcp --vault "/Users/me/Documents/MyVault"
-```
+1. `obsidian-mcp --vault <path> --transport http --api-key "$(openssl rand -hex 32)" --read-only-api-key "$(openssl rand -hex 32)"`
+2. Expose it with a tunnel, e.g. `cloudflared tunnel --url http://127.0.0.1:5199`.
+3. In ChatGPT (developer mode / workspace connectors) add `https://<tunnel-host>/mcp?key=<key>` with no authentication.
+   Start with the **read-only key**; use the read-write key only when you want ChatGPT to update records.
 
-### Gemini CLI
-
-`~/.gemini/settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "obsidian": {
-      "command": "obsidian-mcp",
-      "args": ["--vault", "/Users/me/Documents/MyVault"]
-    }
-  }
-}
-```
-
-### ChatGPT (and claude.ai custom connectors)
-
-These run in the provider's cloud, so they need a **public HTTPS URL** that reaches your computer.
-
-1. Start the server in HTTP mode with a long random key:
-   ```bash
-   obsidian-mcp --vault ~/Documents/MyVault --transport http --api-key "$(openssl rand -hex 32)"
-   ```
-2. Expose it with a tunnel, for example
-   `cloudflared tunnel --url http://127.0.0.1:5199` or `ngrok http 5199`.
-3. **ChatGPT:** Settings → Apps & Connectors → Advanced → enable *Developer mode*, then create a connector with
-   URL `https://<tunnel-host>/mcp?key=<your-key>` and authentication *No authentication*
-   (the key in the URL is the credential, because ChatGPT can't send custom headers).
-   **claude.ai:** Settings → Connectors → Add custom connector, same URL.
-
-Clients that can send headers should use `Authorization: Bearer <key>` or `X-API-Key: <key>` instead of `?key=`.
-
-> ⚠️ Anyone with the URL and key can read (and, unless `--read-only`, modify) your vault. Use `--read-only`
-> unless you need writes, keep the key secret, and stop the tunnel when you're done. For long-term remote use
-> put the server behind a proper OAuth-capable gateway.
+> ⚠️ Anyone with the URL and key can use the vault. Keep keys secret, stop the tunnel when not in use, and check
+> what your firm's ChatGPT workspace allows before connecting professional data. For long-term use, put the server
+> behind an OAuth-capable gateway instead of a key in the URL.
 
 ## Project layout
 
 ```
 src/ObsidianMcp.Server/
-  Program.cs              transports (stdio / HTTP), auth, CLI parsing
-  Vault/VaultService.cs   safe file access, index, search, links, edits
-  Vault/NoteParser.cs     frontmatter, tags, links, headings, link rewriting
-  Tools/*.cs              MCP tool definitions
-tests/ObsidianMcp.Tests/  unit tests + end-to-end test over stdio using the MCP client SDK
+  Program.cs                  transports, API keys, read-only/read-write access control, CLI
+  Vault/VaultService.cs       safe file access, index, search, links, atomic/versioned/audited writes
+  Vault/ChangeTracking.cs     audit log, snapshots, diffs
+  Vault/NoteParser.cs         frontmatter, tags, links, headings
+  Vault/DocumentReader.cs     PDF / DOCX / text extraction, checksums
+  Records/RecordSchema.cs     configurable schema + defaults
+  Records/RecordService.cs    validation, relationship integrity, record writes, deadline protection
+  Records/DocketService.cs    docket query engine, summary, exceptions
+  Records/ContextService.cs   matter / Work Product context assembly, workflows
+  Tools/*.cs                  MCP tool definitions
+samples/demo-vault/           example vault + schema.json
+tests/ObsidianMcp.Tests/      unit tests + end-to-end tests over stdio with the MCP client SDK
 ```

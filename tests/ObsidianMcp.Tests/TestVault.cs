@@ -8,6 +8,27 @@ public sealed class TestVault : IDisposable
 {
     public string Root { get; } = Path.Combine(Path.GetTempPath(), "obsidian-mcp-tests", Guid.NewGuid().ToString("N"));
 
+    /// <summary>Copies an existing folder (e.g. the demo vault) instead of creating the default notes.</summary>
+    public TestVault(string copyFrom)
+    {
+        foreach (var file in Directory.EnumerateFiles(copyFrom, "*", SearchOption.AllDirectories))
+        {
+            var dest = Path.Combine(Root, Path.GetRelativePath(copyFrom, file));
+            Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+            File.Copy(file, dest);
+        }
+    }
+
+    public static string DemoVaultPath
+    {
+        get
+        {
+            var dir = new DirectoryInfo(AppContext.BaseDirectory);
+            while (dir is not null && !Directory.Exists(Path.Combine(dir.FullName, "samples", "demo-vault"))) dir = dir.Parent;
+            return Path.Combine(dir?.FullName ?? throw new DirectoryNotFoundException("samples/demo-vault"), "samples", "demo-vault");
+        }
+    }
+
     public TestVault()
     {
         Write("Home.md", """
@@ -53,8 +74,10 @@ public sealed class TestVault : IDisposable
     public string Read(string rel) => File.ReadAllText(Path.Combine(Root, rel));
     public bool Exists(string rel) => File.Exists(Path.Combine(Root, rel));
 
-    public VaultService Service(bool readOnly = false) =>
-        new(Options.Create(new VaultOptions { Path = Root, ReadOnly = readOnly }));
+    public VaultService Service(bool readOnly = false) => new(OptionsFor(readOnly));
+
+    public IOptions<VaultOptions> OptionsFor(bool readOnly = false) =>
+        Options.Create(new VaultOptions { Path = Root, ReadOnly = readOnly });
 
     public void Dispose()
     {
