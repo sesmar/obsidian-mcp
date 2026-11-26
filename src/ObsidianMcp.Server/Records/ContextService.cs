@@ -56,6 +56,74 @@ public sealed class ContextService(RecordService records, DocketService docket)
         };
     }
 
+    /// <summary>Lists matters with filters; shared by list_matters and get_client_matters.</summary>
+    public IEnumerable<object> Matters(string? client, string? status, string? text, int limit)
+    {
+        var set = records.Snapshot();
+        var mc = Schema.MatterCollection;
+        var clientRecord = client is { Length: > 0 } ? set.Require(RecordSchema.Client, client) : null;
+        var (open, _) = docket.Query(new DocketQuery { Client = clientRecord?.Id, Limit = 1000 }, set);
+        return set.All(RecordSchema.Matter)
+            .Where(m => clientRecord is null || ReferenceEquals(set.Parent(m), clientRecord))
+            .Where(m => string.IsNullOrEmpty(status) || string.Equals(m.Get(mc.StatusProperty), status, StringComparison.OrdinalIgnoreCase))
+            .Where(m => string.IsNullOrEmpty(text) || new[] { m.Id, m.Get(mc.TitleProperty ?? ""), m.Get("application_number") }
+                .Any(v => v?.Contains(text, StringComparison.OrdinalIgnoreCase) == true))
+            .OrderBy(m => m.Id)
+            .Take(Math.Clamp(limit, 1, 1000))
+            .Select(m => new
+            {
+                id = m.Id,
+                client = set.Parent(m)?.Id,
+                title = m.Get(mc.TitleProperty ?? ""),
+                status = m.Get(mc.StatusProperty),
+                matter_type = m.Get("matter_type"),
+                application_number = m.Get("application_number"),
+                open_work_products = open.Count(i => string.Equals(i.Matter, m.Id, StringComparison.OrdinalIgnoreCase)),
+                overdue = open.Count(i => i.Overdue && string.Equals(i.Matter, m.Id, StringComparison.OrdinalIgnoreCase)),
+                path = m.Path,
+            })
+            .ToList();
+    }
+
+    /// <summary>A single matter record (without the consolidated context).</summary>
+    public object Matter(string reference)
+    {
+        var set = records.Snapshot();
+        var matter = set.Require(RecordSchema.Matter, reference);
+        return new
+        {
+            id = matter.Id,
+            client = set.Parent(matter)?.Id,
+            path = matter.Path,
+            version = matter.Note.Version,
+            properties = matter.Properties,
+            content = Truncate(matter.Note.Parsed.Body, Schema.ContextSectionMaxChars * 3),
+            work_products = set.Children(matter, RecordSchema.WorkProduct).Select(w => docket.ToItem(w, set))
+                .OrderBy(i => !i.Active).ThenBy(i => i.DueDate ?? "9999")
+                .Select(i => new { i.Id, i.Type, i.Status, i.DueDate, i.Active }),
+            attachments = Attachments(matter),
+            validation = records.Validate(matter, set),
+        };
+    }
+
+    /// <summary>A single Work Product record (without matter/client context).</summary>
+    public object WorkProduct(string reference)
+    {
+        var set = records.Snapshot();
+        var wp = set.Require(RecordSchema.WorkProduct, reference);
+        var c = Schema.WorkProductCollection;
+        return new
+        {
+            docket = docket.ToItem(wp, set),
+            version = wp.Note.Version,
+            properties = wp.Properties,
+            checklist = RecordService.ParseChecklist(c.ChecklistHeading is null ? null : VaultService.GetSection(wp.Note.Content, c.ChecklistHeading)),
+            content = Truncate(wp.Note.Parsed.Body, Schema.ContextSectionMaxChars * 3),
+            attachments = Attachments(wp),
+            validation = records.Validate(wp, set),
+        };
+    }
+
     public object MatterContext(string reference, int historyLimit)
     {
         var set = records.Snapshot();

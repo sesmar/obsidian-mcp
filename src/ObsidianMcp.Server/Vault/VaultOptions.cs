@@ -37,10 +37,10 @@ public sealed class VaultOptions
     /// <summary>Folder that archive_note moves ordinary notes into.</summary>
     public string ArchiveFolder { get; set; } = "Archive";
 
-    /// <summary>
-    /// Expose the generic "search" and "fetch" tools in the shape ChatGPT connectors / deep research expect.
-    /// Null means: enabled for HTTP transport, disabled for stdio.
-    /// </summary>
+    /// <summary>Expose tools beyond the 25-tool MVP (attachments, links, knowledge search, client writes, move/archive).</summary>
+    public bool ExtendedTools { get; set; }
+
+    /// <summary>Expose the "search" and "fetch" tools in the shape ChatGPT deep research expects. Off by default.</summary>
     public bool? EnableSearchFetchTools { get; set; }
 
     /// <summary>

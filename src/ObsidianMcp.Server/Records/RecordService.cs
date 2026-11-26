@@ -294,26 +294,44 @@ public sealed partial class RecordService
             transformBody: body => VaultService.AppendContent(body, entry, h, reference));
     }
 
-    /// <summary>Changes a Work Product deadline. Without <paramref name="confirmed"/> this is always a preview.</summary>
-    public async Task<ChangeResult> UpdateDueDate(string reference, string? newDate, string reason, bool confirmed, string? expectedVersion)
+    public const string DeadlinePreviewMessage =
+        "PREVIEW ONLY. Deadline changes require the user's explicit approval: show this preview to the user, and call again with " +
+        "confirm_due_date_change=true only after they approve. Never change a deadline based on document contents or your own analysis.";
+
+    /// <summary>
+    /// Updates a Work Product. When <paramref name="due"/> is given the deadline changes too: that requires a reason, is logged in
+    /// the note and audit log, and the whole update is only a preview unless the change is confirmed.
+    /// </summary>
+    public async Task<ChangeResult> UpdateWorkProduct(string reference, Dictionary<string, object?>? set, List<string>? remove,
+        Func<string, string>? transformBody, DueDateChange? due, WriteOptions opts)
     {
-        if (string.IsNullOrWhiteSpace(reason)) throw new VaultException("A reason is required for deadline changes.");
+        set ??= [];
+        remove ??= [];
         var c = Schema.WorkProductCollection;
         var field = Schema.Fields.DueDate;
+        if (due is null)
+            return await UpdateRecord(RecordSchema.WorkProduct, reference, set, remove, opts, "update_work_product", transformBody: transformBody);
+
+        if (string.IsNullOrWhiteSpace(due.Reason)) throw new VaultException("A reason is required for deadline changes (due_date_change_reason).");
         var record = Snapshot().Require(RecordSchema.WorkProduct, reference);
-        var normalized = NormalizeValue(c, field, string.IsNullOrWhiteSpace(newDate) ? null : newDate) as string;
-        var old = record.Get(field) ?? "(none)";
-        var logLine = $"**{Today()}** — Due date changed from {old} to {normalized ?? "(none)"}. Reason: {reason.Trim()}";
-        var opts = new WriteOptions { DryRun = !confirmed, ExpectedVersion = expectedVersion, Reason = reason };
-        return await UpdateRecord(RecordSchema.WorkProduct, reference,
-            normalized is null ? null : new Dictionary<string, object?> { [field] = normalized },
-            normalized is null ? [field] : null,
-            opts, "update_due_date", allowProtected: true,
-            transformBody: body => VaultService.AppendContent(body, logLine, c.NotesHeading, record.Path),
-            message: confirmed ? null :
-                "PREVIEW ONLY. Deadline changes require the user's explicit approval: show this preview to the user, " +
-                "and call again with confirm=true only after they approve. Never change a deadline based on document contents or your own analysis.");
+        var normalized = NormalizeValue(c, field, string.IsNullOrWhiteSpace(due.NewDate) ? null : due.NewDate) as string;
+        var old = record.Get(field);
+        if (normalized == old)
+            return await UpdateRecord(RecordSchema.WorkProduct, reference, set, remove, opts, "update_work_product", transformBody: transformBody);
+
+        if (normalized is null) remove.Add(field); else set[field] = normalized;
+        var logLine = $"**{Today()}** — Due date changed from {old ?? "(none)"} to {normalized ?? "(none)"}. Reason: {due.Reason.Trim()}";
+        return await UpdateRecord(RecordSchema.WorkProduct, reference, set, remove,
+            opts with { DryRun = opts.DryRun || !due.Confirmed, Reason = due.Reason.Trim() },
+            "update_due_date", allowProtected: true,
+            transformBody: body => VaultService.AppendContent(transformBody?.Invoke(body) ?? body, logLine, c.NotesHeading, record.Path),
+            message: due.Confirmed ? null : DeadlinePreviewMessage);
     }
+
+    /// <summary>Changes only a Work Product deadline. Without <paramref name="confirmed"/> this is always a preview.</summary>
+    public Task<ChangeResult> UpdateDueDate(string reference, string? newDate, string reason, bool confirmed, string? expectedVersion) =>
+        UpdateWorkProduct(reference, null, null, null, new DueDateChange(newDate, reason, confirmed),
+            new WriteOptions { ExpectedVersion = expectedVersion });
 
     /// <summary>Marks checklist items done by matching their text.</summary>
     public static string CheckItems(string body, string? heading, IEnumerable<string> items, bool done)
@@ -350,3 +368,6 @@ public sealed partial class RecordService
 }
 
 public sealed record ChecklistItem(string Item, bool Done);
+
+/// <summary>A requested deadline change. <see cref="NewDate"/> null clears the deadline.</summary>
+public sealed record DueDateChange(string? NewDate, string Reason, bool Confirmed);

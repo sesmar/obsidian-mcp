@@ -207,16 +207,20 @@ namespace ObsidianMcp.Server
             DictionaryKeyPolicy = null,
         };
 
+        /// <summary>
+        /// Registers the 25-tool MVP (18 read + 7 write). Write tools are omitted in read-only mode; the extended
+        /// tools and the ChatGPT-style search/fetch pair are opt-in.
+        /// </summary>
         public static IMcpServerBuilder WithVaultTools(this IMcpServerBuilder builder, VaultOptions options, bool http)
         {
-            builder.WithTools<VaultTools>(ToolJson);
-            builder.WithTools<RecordReadTools>(ToolJson);
-            if (!options.ReadOnly)
+            builder.WithTools<CoreReadTools>(ToolJson);
+            if (!options.ReadOnly) builder.WithTools<CoreWriteTools>(ToolJson);
+            if (options.ExtendedTools)
             {
-                builder.WithTools<NoteWriteTools>(ToolJson);
-                builder.WithTools<RecordWriteTools>(ToolJson);
+                builder.WithTools<ExtendedReadTools>(ToolJson);
+                if (!options.ReadOnly) builder.WithTools<ExtendedWriteTools>(ToolJson);
             }
-            if (options.EnableSearchFetchTools ?? http) builder.WithTools<SearchFetchTools>(ToolJson);
+            if (options.EnableSearchFetchTools == true) builder.WithTools<SearchFetchTools>(ToolJson);
             return builder;
         }
 
@@ -274,8 +278,9 @@ namespace ObsidianMcp.Server
                                       Send as 'Authorization: Bearer <key>', 'X-API-Key', or ?key=<key>
               --read-only-api-key <k> Optional second key that only gets read-only tools (or env OBSIDIAN_MCP_READ_API_KEY)
               --no-auth               Allow http without an API key (local testing only)
-              --search-fetch          Also expose ChatGPT-style 'search' and 'fetch' tools (default on for http)
-              --no-search-fetch       Do not expose 'search' and 'fetch'
+              --extended-tools        Also expose tools beyond the 25-tool MVP (list_folder, get_note_links,
+                                      get_attachment, search_knowledge, create_client, update_client, move_note, archive_note)
+              --search-fetch          Also expose ChatGPT 'search' and 'fetch' (needed for ChatGPT deep research)
               --exclude <folder>      Additional folder to hide (repeatable)
               --schema <file>         Record schema JSON (default <vault>/.obsidian-mcp/schema.json, else built-in)
               --print-schema          Print the built-in default schema (save it as .obsidian-mcp/schema.json to customise)
@@ -306,7 +311,7 @@ namespace ObsidianMcp.Server
                     case "--read-only-api-key": cl.Settings["Http:ReadOnlyApiKey"] = Next(); break;
                     case "--no-auth": cl.Settings["Http:AllowAnonymous"] = "true"; break;
                     case "--search-fetch": cl.Settings["Vault:EnableSearchFetchTools"] = "true"; break;
-                    case "--no-search-fetch": cl.Settings["Vault:EnableSearchFetchTools"] = "false"; break;
+                    case "--extended-tools": cl.Settings["Vault:ExtendedTools"] = "true"; break;
                     case "--exclude": excludes.Add(Next()); break;
                     case "--schema": cl.Settings["Vault:SchemaPath"] = Next(); break;
                     default:
