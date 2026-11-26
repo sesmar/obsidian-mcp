@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>obsidian-mcp</AssemblyName>
+    <RootNamespace>ObsidianMcp.Server</RootNamespace>
+    <Version>1.0.0</Version>
+    <Description>MCP server exposing a local Obsidian vault to Claude, ChatGPT, Gemini and other MCP clients.</Description>
+    <PackAsTool>true</PackAsTool>
+    <IsPackable>true</IsPackable>
+    <ToolCommandName>obsidian-mcp</ToolCommandName>
+    <PackageId>obsidian-mcp</PackageId>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.4.0" />
+    <PackageReference Include="YamlDotNet" Version="18.1.0" />
+  </ItemGroup>
+
+</Project>

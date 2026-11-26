@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ObsidianMcp.Server/ObsidianMcp.Server.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ObsidianMcp.Tests/ObsidianMcp.Tests.csproj" />
+  </Folder>
+</Solution>
